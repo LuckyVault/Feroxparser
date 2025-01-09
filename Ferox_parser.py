@@ -6,431 +6,606 @@ import sys
 import argparse
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
+from datetime import datetime
 
 class TreeNode:
     """
     Represents a node in the directory tree.
     """
     def __init__(self, name, is_dir=True):
-        self.name = name  # Name of the directory or file
-        self.is_dir = is_dir  # True if directory, False if file
-        self.children = {}  # key: name, value: TreeNode
+        self.name = name
+        self.is_dir = is_dir
+        self.children = {}
 
     def add_child(self, child_name, is_dir=True):
         if child_name not in self.children:
             self.children[child_name] = TreeNode(child_name, is_dir)
         return self.children[child_name]
 
-    def __repr__(self):
-        return f"TreeNode(name='{self.name}', is_dir={self.is_dir})"
-
 def extract_urls(file_path):
     """
-    Extracts all URLs starting with http:// or https:// from the given file.
-    Skips lines that do not contain URLs.
+    Extracts URLs from the given Feroxbuster output file.
     """
     url_pattern = re.compile(r'(https?://\S+)')
     urls = []
-    with open(file_path, 'r') as file:
-        for line in file:
-            match = url_pattern.search(line)
-            if match:
-                # Extract the URL and remove any trailing characters like spaces or commas
-                url = match.group(1).rstrip(' ,')
-                # Remove any trailing slashes for consistency
-                url = url.rstrip('/')
-                urls.append(url)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                match = url_pattern.search(line)
+                if match:
+                    url = match.group(1).rstrip(' ,')
+                    urls.append(url)
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        sys.exit(1)
     return urls
 
-def is_file(path):
+def is_dir(url):
     """
-    Determines if the given path points to a file based on its extension.
+    Determines if the given URL represents a directory based on trailing slash.
     """
-    # Consider files with extensions or those that match certain patterns
-    return bool(os.path.splitext(path)[1])
+    return url.endswith('/')
+
+def detect_base_url(urls):
+    """
+    Detects the base URL from the list of URLs.
+    """
+    if not urls:
+        return None
+    base_urls = set()
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            base_urls.add(f"{parsed.scheme}://{parsed.netloc}")
+    if len(base_urls) == 1:
+        return list(base_urls)[0]
+    elif len(base_urls) > 1:
+        # Return the base URL with the most matches
+        return max(base_urls, key=lambda x: sum(1 for url in urls if url.startswith(x)))
+    return None
 
 def build_tree(urls, base_url):
     """
     Builds a directory tree from the list of URLs.
     """
-    parsed_base = urlparse(base_url)
     root = TreeNode('/', is_dir=True)
-
+    parsed_base = urlparse(base_url) if base_url else None
     for url in urls:
         parsed = urlparse(url)
         path = parsed.path
-
-        # Ensure the URL starts with the base URL path
-        if not path.startswith(parsed_base.path):
-            # Adjust path if necessary
-            path = path  # Modify as needed based on your specific base path requirements
-
+        if parsed_base and not path.startswith(parsed_base.path):
+            # Adjust path relative to base_url
+            path = urljoin(parsed_base.path, path) if parsed_base.path != '/' else path
         parts = path.strip('/').split('/')
         current_node = root
-
         for i, part in enumerate(parts):
-            if part == '':
-                continue  # Skip empty parts resulting from leading '/'
-            # Determine if this part is a directory or file
-            if i < len(parts) - 1:
-                # Intermediate parts are directories
-                current_node = current_node.add_child(part, is_dir=True)
-            else:
-                # Last part: determine if it's a file or directory
-                if is_file(part):
-                    current_node.add_child(part, is_dir=False)
-                else:
-                    current_node = current_node.add_child(part, is_dir=True)
-
+            if not part:
+                continue
+            # Determine if this part is a directory
+            part_is_dir = True if i < len(parts) - 1 or is_dir(url) else False
+            current_node = current_node.add_child(part, is_dir=part_is_dir)
     return root
 
-def traverse_tree(node, parent_path='', grouped_urls=None, base_url=''):
+def count_directories(node, counts=None, current_path='/', unique_paths=None):
     """
-    Traverses the tree to collect URLs grouped by directories.
-    """
-    if grouped_urls is None:
-        grouped_urls = defaultdict(list)
-
-    current_path = os.path.join(parent_path, node.name)
-    if node.is_dir:
-        # Normalize directory path
-        if parent_path == '' and node.name == '/':
-            directory = base_url + '/'
-        else:
-            directory = urljoin(base_url + '/', current_path.strip('/'))
-            if not directory.endswith('/'):
-                directory += '/'
-        for child in node.children.values():
-            traverse_tree(child, current_path, grouped_urls, base_url)
-    else:
-        # It's a file; associate it with its parent directory
-        directory = urljoin(base_url + '/', parent_path.strip('/') + '/')
-        file_url = urljoin(directory, node.name)
-        grouped_urls[directory].append(file_url)
-
-    return grouped_urls
-
-def count_directories(node, counts=None):
-    """
-    Recursively counts total directories and tracks subdirectories and files per directory.
+    Counts the total directories and files, and organizes directory information.
     """
     if counts is None:
         counts = {
             'total_dirs': 0,
-            'directories': defaultdict(lambda: {'subdirs': 0, 'files': 0})
+            'total_files': 0,
+            'directories': defaultdict(lambda: {'path': '', 'subdirs': 0, 'files': 0, 'items': []})
         }
-
+    if unique_paths is None:
+        unique_paths = set()
     if node.is_dir:
         counts['total_dirs'] += 1
-        current_dir = '/' + node.name.strip('/') + '/' if node.name != '/' else '/'
+        path = os.path.join(current_path, node.name).replace('\\', '/').rstrip('/')
+        if path not in unique_paths:
+            unique_paths.add(path)
+            counts['directories'][path]['path'] = path
         for child in node.children.values():
             if child.is_dir:
-                counts['directories'][current_dir]['subdirs'] += 1
+                counts['directories'][path]['subdirs'] += 1
             else:
-                counts['directories'][current_dir]['files'] += 1
-        for child in node.children.values():
-            count_directories(child, counts)
-
+                counts['directories'][path]['files'] += 1
+                counts['directories'][path]['items'].append(child.name)
+                counts['total_files'] += 1
+            count_directories(child, counts, path + '/', unique_paths)
     return counts
 
-def detect_base_url(urls):
+def identify_important_files(urls):
     """
-    Detects the base URL from the list of URLs.
-    Assumes all URLs share the same base URL.
+    Identifies important files based on predefined patterns.
+    Only the file names and their extensions are considered, not directory names.
     """
-    if not urls:
-        return None
-    parsed = urlparse(urls[0])
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    return base_url
-
-def identify_interesting_files(urls):
-    """
-    Identifies interesting files based on predefined patterns.
-    Returns a dictionary categorizing these files.
-    """
-    patterns = {
-        'Configuration/Environment Files': re.compile(r'\.(env|env\.bak|config\.php|config\.js|config\.xml|web\.config|\.htaccess|\.htpasswd|php\.ini|settings\.py|appsettings\.json)$', re.IGNORECASE),
-        'Backup/Temporary Files': re.compile(r'\.(bak|backup|old|tmp|temp|swp|save|copy|orig)$|~\w+$', re.IGNORECASE),
-        'Database Files': re.compile(r'\.(sql|db|sqlite|sqlite3|mdb|dbf|dump\.sql|backup\.sql)$', re.IGNORECASE),
-        'Source Code': re.compile(r'\.(git|svn|hg)/|\.php_|\.inc$|\.phps$|\.java$|\.cs$|\.py$', re.IGNORECASE),
-        'Log Files': re.compile(r'\.(log)$|error_log$|access_log$|debug\.log$|application\.log$', re.IGNORECASE),
-        'Archive Files': re.compile(r'\.(zip|tar|gz|tar\.gz|rar|7z)$', re.IGNORECASE)
+    important_patterns = {
+        'Password Managers': re.compile(r'\.(kdbx|1pif|psafe3|pwd|dat|bpw|lck)$', re.IGNORECASE),
+        'Backup Files': re.compile(r'\.(bak|backup|old|wbk|bck|tmp)$', re.IGNORECASE),
+        'Network Configuration Files': re.compile(r'\.(conf|cfg|ini|config|htaccess|htpasswd)$', re.IGNORECASE),
+        'Database Files': re.compile(r'\.(sql|db|sqlite|sqlite3|mdb|accdb|frm|myd|myi)$', re.IGNORECASE),
+        'Sensitive Filenames': re.compile(r'\b(admin|password|passwd)\b', re.IGNORECASE)
     }
-
-    interesting_files = defaultdict(list)
-
+    important_files = []
     for url in urls:
-        file_name = os.path.basename(url)
-        for category, pattern in patterns.items():
-            if pattern.search(file_name):
-                interesting_files[category].append(url)
-                break  # Avoid multiple categorizations
+        parsed = urlparse(url)
+        path = parsed.path
+        filename = os.path.basename(path)
+        if not filename:
+            continue  # Skip if it's a directory
+        # Check for sensitive filenames
+        if important_patterns['Sensitive Filenames'].search(filename):
+            truncated = truncate_to_parent(path)
+            important_files.append({'display': truncated, 'url': url})
+            continue
+        # Check for important extensions
+        for category, pattern in important_patterns.items():
+            if category == 'Sensitive Filenames':
+                continue  # Already checked
+            if pattern.search(filename):
+                truncated = truncate_to_parent(path)
+                important_files.append({'display': truncated, 'url': url})
+                break
+    return important_files
 
-    return interesting_files
+def truncate_to_parent(path):
+    """
+    Truncates the path to parent_dir/filename.
+    """
+    parts = path.strip('/').split('/')
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}"
+    elif len(parts) == 1:
+        return parts[0]
+    else:
+        return path
 
-def generate_html_report(counts, grouped_urls, interesting_files, output_path, base_url):
+def categorize_source_files(urls):
     """
-    Generates an HTML report with the summary, interesting files, and grouped URLs.
+    Categorizes all files based on their extensions.
+    Each file type has its own separate box.
     """
-    # Start HTML content
+    extensions = defaultdict(list)
+    
+    for url in urls:
+        parsed = urlparse(url)
+        path = parsed.path
+        if is_dir(url):
+            continue  # Skip directories
+        ext = os.path.splitext(path)[1].lower()
+        if ext:
+            extensions[ext].append(url)
+    
+    # Sort extensions alphabetically
+    sorted_extensions = sorted(extensions.items(), key=lambda x: x[0])
+    
+    return sorted_extensions
+
+def generate_full_directory_tree_html(root, base_url, prefix=''):
+    """
+    Generates an HTML representation of the full directory and file tree using nested lists.
+    Includes visual lines connecting parent directories to subdirectories and files.
+    Highlights important files with animations.
+    """
+    html = ""
+    if root.name != '/':
+        dir_url = urljoin(base_url, root.name + '/')
+        html += f"{prefix}<li><a href='{dir_url}' class='dir-link'>{root.name}/</a>"
+    else:
+        html += f"{prefix}<li><span class='dir-name'>{root.name}</span>"
+
+    if root.children:
+        html += "<ul>"
+        for child in sorted(root.children.values(), key=lambda x: (not x.is_dir, x.name.lower())):
+            if child.is_dir:
+                html += generate_full_directory_tree_html(child, base_url, prefix + "    ")
+            else:
+                # Determine if the file is important
+                is_important = is_file_important(child.name)
+                highlight_class = "important-file" if is_important else ""
+                # Display parent_dir/filename
+                parent_dir = os.path.basename(os.path.dirname(urlparse(child.name).path))
+                display_name = f"{parent_dir}/{child.name}" if parent_dir else child.name
+                file_url = urljoin(base_url, child.name)
+                # Highlight file extension
+                name_parts = child.name.rsplit('.', 1)
+                if len(name_parts) == 2:
+                    filename, extension = name_parts
+                    highlighted = f"{filename}.<span class='file-ext'>{extension}</span>"
+                else:
+                    highlighted = child.name
+                html += f"{prefix}    <li><a href='{file_url}' class='file-link {highlight_class}'>{display_name}</a></li>\n"
+        html += "</ul>"
+    html += "</li>\n"
+    return html
+
+def is_file_important(filename):
+    """
+    Checks if the file is important based on its name or extension.
+    """
+    important_extensions = [
+        '.kdbx', '.1pif', '.psafe3', '.pwd', '.dat', '.bpw', '.lck',  # Password Managers
+        '.bak', '.backup', '.old', '.wbk', '.bck', '.tmp',            # Backup Files
+        '.conf', '.cfg', '.ini', '.config', '.htaccess', '.htpasswd',  # Network Configuration Files
+        '.sql', '.db', '.sqlite', '.sqlite3', '.mdb', '.accdb', '.frm', '.myd', '.myi',  # Database Files
+        '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.rtf', '.pdf', '.odt', '.ods', '.odp', '.txt', '.log', '.json', '.xml', '.yaml', '.yml', '.csv', '.zip', '.rar', '.7z'  # Document & Miscellaneous
+    ]
+    sensitive_keywords = ['admin', 'password', 'passwd']
+    filename_lower = filename.lower()
+    # Check for sensitive keywords in the filename
+    if any(keyword in filename_lower for keyword in sensitive_keywords):
+        return True
+    # Check for important extensions
+    _, ext = os.path.splitext(filename_lower)
+    if ext in important_extensions:
+        return True
+    return False
+
+def generate_html_report(counts, important_files, categorized_files, output_path, base_url, urls, scan_datetime):
+    """
+    Generates the HTML report with the specified structure.
+    """
+    # Generate important files HTML
+    if important_files:
+        important_files_html = '<ul class="important-files">'
+        for file in important_files:
+            important_files_html += f'<li><a href="{file["url"]}" class="important-link" target="_blank">{file["display"]}</a></li>'
+        important_files_html += '</ul>'
+    else:
+        important_files_html = '<p>No Important Files found.</p>'
+
+    # Generate all files categorized by type
+    if categorized_files:
+        all_files_html = '<div class="all-files">'
+        for ext, files in categorized_files:
+            if files:
+                # Sort files alphabetically
+                sorted_files = sorted(files, key=lambda x: os.path.basename(urlparse(x).path).lower())
+                # Determine if collapsible (more than 25 files)
+                is_collapsible = len(sorted_files) > 25
+                displayed_files = sorted_files[:25] if is_collapsible else sorted_files
+                hidden_files = sorted_files[25:] if is_collapsible else []
+                
+                # Remove the dot from extension for display
+                ext_display = ext[1:].upper() if ext.startswith('.') else ext.upper()
+                
+                all_files_html += f'''
+                <div class="file-type-box">
+                    <h3>{ext_display} Files ({len(files)})</h3>
+                    <ul class="file-list">'''
+                for full_url in displayed_files:
+                    filename = os.path.basename(urlparse(full_url).path)
+                    directory = os.path.dirname(urlparse(full_url).path).strip('/')
+                    immediate_dir = os.path.basename(directory) if directory else ''
+                    display_name = f"{immediate_dir}/{filename}" if immediate_dir else filename
+                    all_files_html += f'<li><a href="{full_url}" class="file-link" target="_blank">{display_name}</a></li>'
+                all_files_html += '</ul>'
+                
+                if is_collapsible:
+                    all_files_html += '<ul class="file-list hidden-files">'
+                    for full_url in hidden_files:
+                        filename = os.path.basename(urlparse(full_url).path)
+                        directory = os.path.dirname(urlparse(full_url).path).strip('/')
+                        immediate_dir = os.path.basename(directory) if directory else ''
+                        display_name = f"{immediate_dir}/{filename}" if immediate_dir else filename
+                        all_files_html += f'<li><a href="{full_url}" class="file-link" target="_blank">{display_name}</a></li>'
+                    all_files_html += '</ul>'
+                    # Add toggle button
+                    all_files_html += f'''
+                    <button class="toggle-button" onclick="toggleFiles(this)">Show More</button>
+                </div>'''
+                else:
+                    all_files_html += '</div>'
+        all_files_html += '</div>'
+    else:
+        all_files_html = '<p>No Files Found.</p>'
+
+    # Generate full directory tree
+    full_directory_tree_html = '<ul class="full-directory-tree">' + generate_full_directory_tree_html(build_tree(urls, base_url), base_url) + '</ul>'
+
+    # Construct the final HTML content with Ubuntu-like CSS and JavaScript for collapsible sections and animations
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Feroxbuster Report</title>
+    <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;700&display=swap" rel="stylesheet">
     <style>
-        /* Google-inspired Clean and Modern Design */
+        /* Ubuntu-Like Theme */
         body {{
-            font-family: 'Roboto', sans-serif;
+            font-family: 'Ubuntu', sans-serif;
+            background-color: #f5f5f5; /* Light background */
+            color: #333333; /* Dark text for contrast */
             margin: 0;
-            padding: 0;
-            background-color: #f5f5f5;
-            color: #333;
+            padding: 20px;
+            animation: fadeIn 1s ease-in-out;
         }}
         .container {{
-            width: 95%;
             max-width: 1400px;
-            margin: 20px auto;
+            margin: 0 auto;
+            padding: 20px;
         }}
         h1 {{
+            color: #4B8BBE; /* Ubuntu blue */
             text-align: center;
-            color: #4285F4;
             margin-bottom: 40px;
-        }}
-        .box {{
-            background-color: #fff;
-            padding: 20px;
-            margin-bottom: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        .box h2 {{
-            border-bottom: 2px solid #4285F4;
+            font-size: 2.5em;
+            font-weight: 700;
+            border-bottom: 3px solid #4B8BBE;
             padding-bottom: 10px;
-            color: #333;
-            margin-top: 0;
         }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
+        h2, h3 {{
+            color: #4B8BBE;
+            font-weight: 700;
+            margin-top: 20px;
+            margin-bottom: 10px;
         }}
-        th, td {{
-            padding: 12px;
-            border-bottom: 1px solid #ddd;
-            text-align: left;
+        .section {{
+            background-color: #ffffff; /* White background for sections */
+            border: 1px solid #dddddd;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+            transition: box-shadow 0.3s ease;
         }}
-        th {{
-            background-color: #4285F4;
-            color: #fff;
+        .section:hover {{
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.15);
         }}
-        tr:hover {{
-            background-color: #f1f1f1;
-        }}
-        .interesting-files {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
-        }}
-        .category-box {{
-            flex: 1 1 300px;
-            background-color: #e8f0fe;
+        .summary {{
+            font-size: 1.1em;
             padding: 15px;
-            border-left: 5px solid #4285F4;
+            background: #f9f9f9;
             border-radius: 4px;
+            margin-bottom: 20px;
+            border: 1px solid #dddddd;
         }}
-        .category-box h3 {{
-            margin-top: 0;
-            color: #4285F4;
-        }}
-        .category-box ul {{
+        .important-files {{
             list-style-type: none;
             padding-left: 0;
         }}
-        .category-box li {{
-            margin-bottom: 8px;
-        }}
-        .url-list {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
-        }}
-        .directory-box {{
-            background-color: #fff;
-            padding: 15px;
-            border-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            width: calc(50% - 20px); /* Two boxes per row with gap */
-            box-sizing: border-box;
-        }}
-        .directory-box h3 {{
-            margin-top: 0;
-            color: #4285F4;
-            font-size: 1.2em;
-        }}
-        .directory-box ul {{
-            list-style-type: none;
-            padding-left: 0;
-        }}
-        .directory-box li {{
+        .important-files li {{
             margin-bottom: 5px;
-            word-break: break-all;
         }}
-        a {{
-            color: #4285F4;
+        .important-link {{
+            color: #E74C3C; /* Red for important files */
             text-decoration: none;
+            font-weight: bold;
+            animation: blink 1s infinite;
         }}
-        a:hover {{
+        .important-link:hover {{
             text-decoration: underline;
         }}
-        @media (max-width: 1024px) {{
-            .directory-box {{
-                width: calc(50% - 20px); /* Two boxes per row */
-            }}
+        @keyframes blink {{
+            0% {{ opacity: 1; }}
+            50% {{ opacity: 0.5; }}
+            100% {{ opacity: 1; }}
         }}
+        .all-files {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }}
+        .file-type-box {{
+            background: #ffffff;
+            padding: 15px;
+            border-radius: 6px;
+            border: 1px solid #dddddd;
+            flex: 1 1 250px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+            max-height: 400px;
+            overflow: hidden;
+            position: relative;
+        }}
+        .file-type-box:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.15);
+        }}
+        .file-type-box h3 {{
+            color: #4B8BBE;
+            margin-top: 0;
+            font-size: 1.2em;
+            border-bottom: 1px solid #dddddd;
+            padding-bottom: 8px;
+        }}
+        .file-list a {{
+            color: #4B8BBE;
+            text-decoration: none;
+            transition: color 0.2s;
+        }}
+        .file-list a:hover {{
+            color: #2E86C1; /* Darker blue on hover */
+            text-decoration: underline;
+        }}
+        .full-directory-tree {{
+            list-style-type: none;
+            padding-left: 20px;
+        }}
+        .full-directory-tree ul {{
+            list-style-type: none;
+            padding-left: 20px;
+        }}
+        .full-directory-tree li {{
+            margin: 5px 0;
+            position: relative;
+            font-size: 0.95em;
+        }}
+        .full-directory-tree li::before {{
+            content: '';
+            position: absolute;
+            top: 10px;
+            left: -10px;
+            border-left: 1px solid #4B8BBE;
+            border-bottom: 1px solid #4B8BBE;
+            width: 10px;
+            height: 10px;
+        }}
+        .dir-link {{
+            color: #4B8BBE;
+            text-decoration: none;
+            font-weight: 700;
+        }}
+        .dir-link:hover {{
+            text-decoration: underline;
+        }}
+        .file-link {{
+            color: #4B8BBE;
+            text-decoration: none;
+        }}
+        .file-link:hover {{
+            color: #2E86C1;
+            text-decoration: underline;
+        }}
+        .file-ext {{
+            color: #E74C3C; /* Red for file extensions */
+            font-weight: bold;
+        }}
+        .important-file {{
+            animation: highlight 2s infinite;
+        }}
+        @keyframes highlight {{
+            0% {{ background-color: #fff; }}
+            50% {{ background-color: #ffcccc; }}
+            100% {{ background-color: #fff; }}
+        }}
+        .toggle-button {{
+            background-color: #4B8BBE;
+            color: #ffffff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 10px;
+            font-size: 0.9em;
+            transition: background-color 0.2s;
+        }}
+        .toggle-button:hover {{
+            background-color: #2E86C1;
+        }}
+        @keyframes fadeIn {{
+            from {{ opacity: 0; }}
+            to {{ opacity: 1; }}
+        }}
+        /* Responsive Design */
         @media (max-width: 768px) {{
-            .directory-box {{
-                width: 100%; /* Single column on smaller screens */
-            }}
-            .interesting-files {{
+            .all-files {{
                 flex-direction: column;
+            }}
+            .file-type-box {{
+                flex: 1 1 100%;
             }}
         }}
     </style>
+    <script>
+        function toggleFiles(button) {{
+            var hiddenList = button.previousElementSibling;
+            if (hiddenList.style.display === "none" || hiddenList.style.display === "") {{
+                hiddenList.style.display = "block";
+                button.textContent = "Show Less";
+            }} else {{
+                hiddenList.style.display = "none";
+                button.textContent = "Show More";
+            }}
+        }}
+    </script>
 </head>
 <body>
     <div class="container">
-        <h1>Feroxbuster HTML Report</h1>
+        <h1>Feroxbuster Report</h1>
         
-        <!-- Summary Section -->
-        <div class="box">
-            <h2>Summary</h2>
-            <table>
-                <tr>
-                    <th>Total Directories Found</th>
-                </tr>
-                <tr>
-                    <td>{counts['total_dirs']}</td>
-                </tr>
-            </table>
-            
-            <h3>Main Directories and Their Details</h3>
-            <table>
-                <tr>
-                    <th>Directory</th>
-                    <th>Subdirectories</th>
-                    <th>Files</th>
-                </tr>
-"""
-    # Add summary rows
-    for directory, info in sorted(counts['directories'].items()):
-        html_content += f"""                <tr>
-                    <td><a href="{directory}" target="_blank">{directory}</a></td>
-                    <td>{info['subdirs']}</td>
-                    <td>{info['files']}</td>
-                </tr>
-"""
-    html_content += """            </table>
+        <!-- Report Summary -->
+        <div class="section">
+            <h2>Report Summary</h2>
+            <div class="summary">
+                <strong>Webserver URL:</strong> <a href="{base_url}" class="dir-link" target="_blank">{base_url if base_url else "N/A"}</a><br>
+                <strong>Date/Time of Scan:</strong> {scan_datetime}
+            </div>
         </div>
-        
-        <!-- Interesting Files Section -->
-"""
-    if interesting_files:
-        html_content += """        <div class="box">
-            <h2>Interesting Files</h2>
-            <div class="interesting-files">
-"""
-        for category, files in sorted(interesting_files.items()):
-            if files:
-                html_content += f"""                <div class="category-box">
-                    <h3>{category} ({len(files)})</h3>
-                    <ul>
-"""
-                for file_url in sorted(files):
-                    html_content += f'                        <li><a href="{file_url}" target="_blank">{file_url}</a></li>\n'
-                html_content += """                    </ul>
-                </div>
-"""
-        html_content += """            </div>
-        </div>
-"""
-    else:
-        html_content += """        <div class="box">
-            <h2>Interesting Files</h2>
-            <p>No interesting files found.</p>
-        </div>
-"""
 
-    # Grouped URLs Section
-    html_content += """        <div class="box">
-            <h2>Grouped URLs</h2>
-            <div class="url-list">
-"""
-    for directory in sorted(grouped_urls.keys()):
-        html_content += f"""                <div class="directory-box">
-                    <h3>Directory: <a href="{directory}" target="_blank">{directory}</a></h3>
-                    <ul>
-"""
-        for url in sorted(grouped_urls[directory]):
-            html_content += f'                        <li><a href="{url}" target="_blank">{url}</a></li>\n'
-        html_content += """                    </ul>
-                </div>
-"""
-    html_content += """            </div>
+        <!-- Important Files -->
+        <div class="section">
+            <h2>Important Files</h2>
+            {important_files_html}
+        </div>
+
+        <!-- All Files -->
+        <div class="section">
+            <h2>All Files</h2>
+            {all_files_html}
+        </div>
+
+        <!-- Full Directory Tree -->
+        <div class="section">
+            <h2>Full Directory Tree</h2>
+            <div class="full-directory-tree">
+                {full_directory_tree_html}
+            </div>
         </div>
     </div>
 </body>
 </html>"""
 
-    # Write to the output HTML file
     try:
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        print(f"HTML report successfully generated at '{output_path}'.")
+        print(f"Report generated successfully: {output_path}")
     except Exception as e:
-        print(f"Error writing HTML report to '{output_path}': {e}")
+        print(f"Error generating report: {e}")
+        sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse Feroxbuster output, group URLs by directory, identify interesting files, and generate a modern HTML report.")
-    parser.add_argument('input_file', help="Path to the Feroxbuster output file.")
-    parser.add_argument('-o', '--output_file', help="Path to save the HTML report. Default is 'ferox_report.html'.", default='ferox_report.html')
-
+    """
+    Main function to parse arguments and generate the report.
+    """
+    parser = argparse.ArgumentParser(description="Feroxbuster HTML Report Generator")
+    parser.add_argument("input_file", help="Path to the Feroxbuster output file")
+    parser.add_argument("-o", "--output", default="ferox_report.html", 
+                        help="Output HTML report file path (default: ferox_report.html)")
+    parser.add_argument("-d", "--datetime", default=None, 
+                        help="Date and time of the scan (e.g., '2023-10-01 12:30:00'). If not provided, current date/time is used.")
     args = parser.parse_args()
-    input_file = args.input_file
-    output_file = args.output_file
 
-    if not os.path.isfile(input_file):
-        print(f"Error: The file '{input_file}' does not exist.")
+    if not os.path.isfile(args.input_file):
+        print(f"Error: Input file '{args.input_file}' does not exist.")
         sys.exit(1)
 
-    # Extract URLs from the file
-    urls = extract_urls(input_file)
+    print("Extracting URLs...")
+    urls = extract_urls(args.input_file)
     if not urls:
-        print("No URLs found in the file.")
-        sys.exit(0)
-
-    # Detect base URL
-    base_url = detect_base_url(urls)
-    if not base_url:
-        print("Error: Could not determine base URL. Please ensure the input file contains valid URLs.")
+        print("No URLs found in input file")
         sys.exit(1)
-    print(f"Detected Base URL: {base_url}\n")
 
-    # Identify interesting files
-    interesting_files = identify_interesting_files(urls)
+    base_url = detect_base_url(urls)
+    if base_url:
+        print(f"Detected base URL: {base_url}")
+    else:
+        print("Warning: Could not determine a single base URL")
 
-    # Build directory tree
-    tree_root = build_tree(urls, base_url)
-
-    # Count directories, subdirectories, and files
-    counts = count_directories(tree_root)
-
-    # Traverse tree to group URLs
-    grouped_urls = traverse_tree(tree_root, base_url=base_url)
-
-    # Generate HTML report
-    generate_html_report(counts, grouped_urls, interesting_files, output_file, base_url)
+    print("Building directory tree...")
+    root = build_tree(urls, base_url)
+    
+    print("Analyzing directories...")
+    counts = count_directories(root)
+    
+    print("Identifying important files...")
+    important_files = identify_important_files(urls)
+    
+    print("Categorizing all files...")
+    categorized_files = categorize_source_files(urls)
+    
+    print("Preparing scan date/time...")
+    if args.datetime:
+        try:
+            scan_datetime = datetime.strptime(args.datetime, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            print("Error: Date/time format should be 'YYYY-MM-DD HH:MM:SS'")
+            sys.exit(1)
+    else:
+        scan_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    print("Generating report...")
+    generate_html_report(counts, important_files, categorized_files, args.output, base_url, urls, scan_datetime)
 
 if __name__ == "__main__":
     main()
