@@ -1,9 +1,8 @@
-### python ferox_parser.py ferox_scan_results.txt
-### This creates ferox_report.html.
-
 import re
 import json
+import sys
 from html import escape
+from urllib.parse import urlparse
 
 def parse_size(size_str):
     """
@@ -12,15 +11,15 @@ def parse_size(size_str):
     match = re.search(r'(\d+)c', size_str)
     if not match:
         return ''
-    bytes = int(match.group(1))
-    if bytes < 1024:
-        return f"{bytes} B"
-    elif bytes < 1024 * 1024:
-        return f"{(bytes / 1024):.1f} KB"
+    bytes_size = int(match.group(1))
+    if bytes_size < 1024:
+        return f"{bytes_size} B"
+    elif bytes_size < 1024 * 1024:
+        return f"{(bytes_size / 1024):.1f} KB"
     else:
-        return f"{(bytes / (1024 * 1024)):.1f} MB"
+        return f"{(bytes_size / (1024 * 1024)):.1f} MB"
 
-def parse_ferox_line(line):
+def parse_ferox_line(line, base_url):
     """
     Parses each line of the feroxbuster output to extract relevant information.
     """
@@ -29,9 +28,13 @@ def parse_ferox_line(line):
         return None
     if parts[0] != '200':
         return None
-    # Adjust the base URL as per your setup
-    base_url = 'http://192.168.176.141:81/'
-    path = parts[-1].replace(base_url, '')
+    full_url = parts[-1]
+    if full_url.startswith(base_url):
+        path = full_url.replace(base_url, '', 1)
+    else:
+        # Extract the path component from the URL
+        parsed_url = urlparse(full_url)
+        path = parsed_url.path
     size = parse_size(parts[4])
     return path, size
 
@@ -117,10 +120,11 @@ def build_tree(files, critical_files):
             current = current.children[lower_part]
     return root.to_dict()
 
-def generate_html(tree_data, critical_files):
+def generate_html(tree_data, critical_files, base_url):
     """
     Generates an interactive HTML report based on the directory tree data and critical files.
     """
+    # Escape double braces for JavaScript template literals
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -276,7 +280,7 @@ def generate_html(tree_data, critical_files):
             <div class="category-box">
                 <h2>Critical Files</h2>
                 <div class="category-list">
-                    {''.join([f'<a href="http://192.168.176.141:81/{escape(item["path"])}" target="_blank">{escape(item["path"])}</a>' for item in critical_files])}
+                    {''.join([f'<a href="{escape(base_url + "/" + item["path"])}" target="_blank">{escape(item["path"])}</a>' for item in critical_files])}
                 </div>
             </div>
             ''' if critical_files else ''}
@@ -299,7 +303,7 @@ def generate_html(tree_data, critical_files):
 
     <script>
         const treeData = {json.dumps(tree_data)};
-        const criticalFiles = {json.dumps([item['path'] for item in critical_files])};
+        const criticalFiles = {json.dumps([item['path'].lower() for item in critical_files])};
 
         function formatFileName(name) {{
             const parts = name.split('.');
@@ -337,15 +341,17 @@ def generate_html(tree_data, critical_files):
             }}
         }}
 
-        function createTreeNode(node, baseUrl = 'http://192.168.176.141:81') {{
+        function createTreeNode(node, parentPath = '') {{
             const div = document.createElement('div');
             div.className = 'tree-node';
 
             const nodeContent = document.createElement('div');
             nodeContent.className = 'node-content';
 
+            // Construct the full path
+            const currentPath = parentPath ? `${{parentPath}}/${{node.name}}` : node.name;
+
             // Apply highlighting if the file is critical
-            const currentPath = getCurrentPath(node);
             if (criticalFiles.includes(currentPath.toLowerCase())) {{
                 nodeContent.classList.add('highlight-critical');
             }}
@@ -386,12 +392,14 @@ def generate_html(tree_data, critical_files):
 
             const icon = document.createElement('span');
             icon.className = 'icon';
-            icon.textContent = hasChildren ? '📁 ' : '📄 ';
+            icon.textContent = hasChildren ? '📁' : '📄';
             nodeContent.appendChild(icon);
 
             const nameContainer = document.createElement('a');
             nameContainer.className = 'node-name';
-            nameContainer.href = `${{baseUrl}}/${{node.name}}`;
+            // Use the correct base URL here
+            const baseUrl = "{escape(base_url)}";  // Updated base URL
+            nameContainer.href = `${{baseUrl}}/${{currentPath}}`;
             nameContainer.target = '_blank';
             nameContainer.innerHTML = hasChildren ? escapeHtml(node.name) : formatFileName(escapeHtml(node.name));
             nodeContent.appendChild(nameContainer);
@@ -411,23 +419,13 @@ def generate_html(tree_data, critical_files):
                 childContainer.style.display = 'block';  // Start expanded
                 node.children.forEach(child => {{
                     childContainer.appendChild(
-                        createTreeNode(child, `${{baseUrl}}/${{node.name}}`)
+                        createTreeNode(child, currentPath)
                     );
                 }});
                 div.appendChild(childContainer);
             }}
 
             return div;
-        }}
-
-        function getCurrentPath(node) {{
-            const names = [];
-            let current = node;
-            while (current && current.name) {{
-                names.unshift(current.name);
-                current = current.parent;
-            }}
-            return names.join('/');
         }}
 
         function escapeHtml(text) {{
@@ -441,16 +439,7 @@ def generate_html(tree_data, critical_files):
             return text.replace(/[&<>"']/g, function(m) {{ return map[m]; }});
         }}
 
-        // Enhancing the tree data with parent references for path construction
-        function addParentReferences(node, parent = null) {{
-            node.parent = parent;
-            if (node.children) {{
-                node.children.forEach(child => addParentReferences(child, node));
-            }}
-        }}
-
-        addParentReferences(treeData);
-
+        // Initialize the tree
         document.getElementById('tree-root').appendChild(createTreeNode(treeData));
     </script>
 </body>
@@ -461,16 +450,23 @@ def main():
     Main function to parse feroxbuster results, categorize critical files, build the directory tree,
     and generate the HTML report.
     """
+    if len(sys.argv) != 2:
+        print("Usage: python3 Ferox_parser.py ferox_scan_results.txt")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    base_url = 'http://192.168.244.141:81'  # Update this to match your feroxbuster scan URL
+
     print("Starting to parse feroxbuster results...")
     try:
-        with open('ferox_scan_results.txt', 'r') as f:
-            print("Reading ferox_scan_results.txt...")
+        with open(input_file, 'r') as f:
+            print(f"Reading {input_file}...")
             lines = f.readlines()
 
         files = {}
         duplicates = 0
         for line in lines:
-            result = parse_ferox_line(line)
+            result = parse_ferox_line(line, base_url + '/')
             if result:
                 path, size = result
                 if path.lower() in {p.lower() for p in files.keys()}:
@@ -487,8 +483,8 @@ def main():
         tree = build_tree(files, critical_files)
 
         print("Generating HTML report...")
-        html_output = generate_html(tree, critical_files)
-        
+        html_output = generate_html(tree, critical_files, base_url)
+
         output_file = 'ferox_report.html'
         with open(output_file, 'w') as f:
             f.write(html_output)
@@ -499,8 +495,8 @@ def main():
         print("\nOpen the HTML file in your browser to view the report.")
 
     except FileNotFoundError:
-        print("Error: Could not find ferox_scan_results.txt")
-        print("Please make sure to save your feroxbuster output to ferox_scan_results.txt in the same directory as this script.")
+        print(f"Error: Could not find {input_file}")
+        print(f"Please make sure to save your feroxbuster output to {input_file} in the same directory as this script.")
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         raise
